@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calorie Scanner</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Hide the video element by default */
+        #video-container {
+            display: none;
+            position: relative;
+        }
+        #video {
+            width: 100%;
+            height: auto;
+            border-radius: 0.5rem; /* rounded-lg */
+        }
+        /* Styling for the log items */
+        .log-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem; /* p-3 */
+            background-color: #374151; /* bg-gray-700 */
+            border-radius: 0.5rem; /* rounded-lg */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white h-full overflow-y-auto">
+
+    <div class="container mx-auto max-w-2xl p-4 space-y-6">
+        
+        <header class="text-center">
+            <h1 class="text-3xl font-bold text-blue-400">Calorie Scanner</h1>
+            <p class="text-gray-400">Log your food by scanning barcodes.</p>
+        </header>
+
+        <!-- Scanner Controls -->
+        <section class="bg-gray-800 p-4 rounded-lg shadow-lg space-y-4">
+            <h2 class="text-xl font-semibold mb-2">Scan Barcode</h2>
+            <div id="scanner-controls" class="flex gap-4">
+                <button id="start-scan-btn" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-200">
+                    Start Camera
+                </button>
+                <button id="stop-scan-btn" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-200" style="display: none;">
+                    Stop Camera
+                </button>
+            </div>
+            <p id="scanner-support-status" class="text-sm text-yellow-400 text-center"></p>
+
+            <!-- Video Feed -->
+            <div id="video-container" class="bg-gray-700 rounded-lg overflow-hidden">
+                <video id="video" autoplay playsinline muted></video>
+            </div>
+
+            <!-- Manual Entry Fallback -->
+            <div class="space-y-2">
+                <label for="manual-barcode" class="block text-sm font-medium text-gray-300">Or Enter Barcode Manually:</label>
+                <div class="flex gap-2">
+                    <input type="text" id="manual-barcode" class="flex-grow bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Enter barcode number...">
+                    <button id="manual-lookup-btn" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition duration-200">
+                        Find
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Status and Product Info -->
+        <section>
+            <!-- Status Message -->
+            <div id="status-message" class="text-center text-gray-400 h-6 mb-4"></div>
+
+            <!-- Product Info Display -->
+            <div id="product-info" class="bg-gray-800 p-4 rounded-lg shadow-lg" style="display: none;">
+                <!-- Content will be injected by JS -->
+            </div>
+        </section>
+
+        <!-- Daily Food Log -->
+        <section class="bg-gray-800 p-4 rounded-lg shadow-lg space-y-4">
+            <div class="flex justify-between items-center">
+                <h2 class="text-xl font-semibold">Today's Log</h2>
+                <div id="total-calories" class="text-2xl font-bold text-blue-400">Total: 0 kcal</div>
+            </div>
+            <div id="food-log-list" class="space-y-3 max-h-96 overflow-y-auto">
+                <!-- Log items will be injected by JS -->
+                <p id="empty-log-msg" class="text-gray-500 text-center py-4">Your food log is empty.</p>
+            </div>
+        </section>
+
+    </div>
+
+    <!-- Firebase and App Logic -->
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged,
+            setPersistence,
+            inMemoryPersistence
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc, 
+            addDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            serverTimestamp,
+            query,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables ---
+        let db, auth, userId;
+        let barcodeDetector;
+        let videoStream;
+        let currentProduct = null;
+        let foodLog = []; // Local cache of the food log
+
+        // --- DOM Elements ---
+        const startScanBtn = document.getElementById('start-scan-btn');
+        const stopScanBtn = document.getElementById('stop-scan-btn');
+        const videoContainer = document.getElementById('video-container');
+        const videoEl = document.getElementById('video');
+        const manualBarcodeEl = document.getElementById('manual-barcode');
+        const manualLookupBtn = document.getElementById('manual-lookup-btn');
+        const statusMessageEl = document.getElementById('status-message');
+        const productInfoEl = document.getElementById('product-info');
+        const foodLogListEl = document.getElementById('food-log-list');
+        const totalCaloriesEl = document.getElementById('total-calories');
+        const emptyLogMsg = document.getElementById('empty-log-msg');
+        const scannerSupportStatusEl = document.getElementById('scanner-support-status');
+
+        // --- Firebase Setup ---
+
+        // Use global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-calorie-scanner';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        /**
+         * Initializes Firebase app, auth, and Firestore.
+         * Sets up authentication listener.
+         */
+        async function setupFirebase() {
+            try {
+                // setLogLevel('Debug'); // Uncomment for detailed logs
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Persist auth state in memory
+                await setPersistence(auth, inMemoryPersistence);
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        console.log("User is signed in. UID:", user.uid);
+                        userId = user.uid;
+                        // User is authenticated, now we can load their data
+                        loadFoodLog();
+                    } else {
+                        console.log("User is signed out.");
+                        userId = null;
+                    }
+                });
+
+                // Sign in
+                if (initialAuthToken) {
+                    console.log("Signing in with custom token...");
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    console.log("Signing in anonymously...");
+                    await signInAnonymously(auth);
+                }
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                setStatus("Error connecting to database. Please refresh.");
+            }
+        }
+
+        /**
+         * Helper to get the path to the user's private food log collection.
+         */
+        function getFoodLogCollection() {
+            if (!userId) throw new Error("User not authenticated.");
+            // Use private user data path
+            return `/artifacts/${appId}/users/${userId}/foodLog`;
+        }
+
+        /**
+         * Sets up a real-time listener for the user's food log.
+         */
+        function loadFoodLog() {
+            if (!userId) return;
+
+            try {
+                const logCollectionPath = getFoodLogCollection();
+                const q = query(collection(db, logCollectionPath));
+
+                // onSnapshot attaches a real-time listener
+                onSnapshot(q, (snapshot) => {
+                    foodLog = [];
+                    snapshot.forEach((doc) => {
+                        foodLog.push({ id: doc.id, ...doc.data() });
+                    });
+                    // Sort by timestamp, newest first (optional)
+                    foodLog.sort((a, b) => (b.addedAt?.seconds || 0) - (a.addedAt?.seconds || 0));
+                    renderFoodLog();
+                }, (error) => {
+                    console.error("Error listening to food log:", error);
+                    setStatus("Error loading food log.");
+                });
+            } catch (error) {
+                console.error("Error in loadFoodLog:", error);
+            }
+        }
+
+        /**
+         * Adds the currentProduct to the Firestore database.
+         */
+        async function addFoodToLog() {
+            if (!userId || !currentProduct) return;
+
+            const itemToAdd = {
+                name: currentProduct.name,
+                calories: currentProduct.calories,
+                serving: currentProduct.serving,
+                barcode: currentProduct.barcode,
+                addedAt: serverTimestamp() // Use server timestamp
+            };
+
+            try {
+                setStatus("Adding to log...");
+                const logCollectionPath = getFoodLogCollection();
+                await addDoc(collection(db, logCollectionPath), itemToAdd);
+                
+                // Clear the product info box
+                productInfoEl.style.display = 'none';
+                productInfoEl.innerHTML = '';
+                currentProduct = null;
+                setStatus("Item added to log.");
+            } catch (error) {
+                console.error("Error adding document:", error);
+                setStatus("Failed to add item. Please try again.");
+            }
+        }
+
+        /**
+         * Deletes a food item from the Firestore database.
+         * @param {string} docId - The Firestore document ID to delete.
+         */
+        async function deleteFoodItem(docId) {
+            if (!userId) return;
+
+            try {
+                const logDocRef = doc(db, getFoodLogCollection(), docId);
+                await deleteDoc(logDocRef);
+                // The onSnapshot listener will automatically refresh the UI
+                setStatus("Item removed.");
+            } catch (error) {
+                console.error("Error deleting document:", error);
+                setStatus("Failed to remove item.");
+            }
+        }
+
+        // --- UI Rendering ---
+
+        /**
+         * Renders the local foodLog array to the DOM.
+         */
+        function renderFoodLog() {
+            foodLogListEl.innerHTML = ''; // Clear existing list
+            let total = 0;
+
+            if (foodLog.length === 0) {
+                emptyLogMsg.style.display = 'block';
+            } else {
+                emptyLogMsg.style.display = 'none';
+                foodLog.forEach(item => {
+                    const calories = parseFloat(item.calories);
+                    if (!isNaN(calories)) {
+                        total += calories;
+                    }
+
+                    const itemEl = document.createElement('div');
+                    itemEl.className = 'log-item animate-fade-in'; // Using a simple class name
+                    itemEl.innerHTML = `
+                        <div>
+                            <p class="font-semibold">${item.name}</p>
+                            <p class="text-sm text-gray-400">${item.serving || 'N/A'} - <span class="text-blue-300 font-medium">${isNaN(calories) ? 'N/A' : calories.toFixed(0)} kcal</span></p>
+                        </div>
+                        <button class="delete-btn bg-red-700 hover:bg-red-800 text-white text-xs font-bold py-1 px-2 rounded-full transition duration-200" data-id="${item.id}">
+                            &times;
+                        </button>
+                    `;
+                    
+                    // Add event listener directly to the button
+                    itemEl.querySelector('.delete-btn').addEventListener('click', () => {
+                        deleteFoodItem(item.id);
+                    });
+
+                    foodLogListEl.appendChild(itemEl);
+                });
+            }
+
+            totalCaloriesEl.textContent = `Total: ${total.toFixed(0)} kcal`;
+        }
+
+        /**
+         * Renders the found product info and an "Add" button.
+         * @param {object} product - The product object.
+         */
+        function renderProductInfo(product) {
+            const calories = parseFloat(product.calories);
+            productInfoEl.innerHTML = `
+                <h3 class="text-lg font-bold">${product.name}</h3>
+                <p class="text-gray-300"><strong>Serving:</strong> ${product.serving}</p>
+                <p class="text-2xl text-blue-300 font-semibold">${isNaN(calories) ? 'N/A' : calories.toFixed(0)} calories</p>
+                <p class="text-sm text-gray-500">Barcode: ${product.barcode}</p>
+                <button id="add-to-log-btn" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg mt-4 transition duration-200">
+                    Add to Log
+                </button>
+            `;
+            productInfoEl.style.display = 'block';
+            
+            // Add listener for the new button
+            document.getElementById('add-to-log-btn').addEventListener('click', addFoodToLog);
+        }
+
+        /**
+         * Sets the status message.
+         * @param {string} message - The message to display.
+         */
+        function setStatus(message) {
+            statusMessageEl.textContent = message;
+        }
+
+        // --- Barcode Scanner Logic ---
+
+        /**
+         * Checks for BarcodeDetector API support.
+         */
+        function checkScannerSupport() {
+            if (!('BarcodeDetector' in window)) {
+                console.warn("Barcode Detector API not supported.");
+                scannerSupportStatusEl.textContent = "Camera scanner not supported on this browser. Use manual entry.";
+                startScanBtn.disabled = true;
+                startScanBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                return false;
+            }
+            
+            // Try to instantiate it
+            try {
+                 barcodeDetector = new BarcodeDetector({ 
+                    formats: ['ean_13', 'upc_a', 'ean_8', 'upc_e'] 
+                });
+                return true;
+            } catch (e) {
+                console.error("Error instantiating BarcodeDetector:", e);
+                scannerSupportStatusEl.textContent = "Error initializing scanner. Use manual entry.";
+                startScanBtn.disabled = true;
+                startScanBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                return false;
+            }
+        }
+
+        /**
+         * Starts the camera feed.
+         */
+        async function startScanner() {
+            if (!barcodeDetector) {
+                setStatus("Scanner not initialized.");
+                return;
+            }
+
+            try {
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' } // Prefer back camera
+                });
+
+                videoEl.srcObject = videoStream;
+                videoEl.play(); // Start playing the video
+                videoContainer.style.display = 'block';
+                startScanBtn.style.display = 'none';
+                stopScanBtn.style.display = 'block';
+                setStatus("Point camera at a barcode...");
+
+                // Start the detection loop
+                detectBarcode();
+            } catch (err) {
+                console.error("Error starting camera:", err);
+                setStatus("Could not access camera. Check permissions.");
+                scannerSupportStatusEl.textContent = "Could not access camera. Please grant permission and refresh.";
+            }
+        }
+
+        /**
+         * Stops the camera feed.
+         */
+        function stopScanner() {
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+            videoContainer.style.display = 'none';
+            startScanBtn.style.display = 'block';
+            stopScanBtn.style.display = 'none';
+            setStatus("");
+        }
+
+        /**
+         * Recursively scans frames for a barcode.
+         */
+        async function detectBarcode() {
+            // Stop if the stream has been closed
+            if (!videoStream || videoEl.paused || videoEl.ended) return;
+
+            try {
+                const barcodes = await barcodeDetector.detect(videoEl);
+                if (barcodes.length > 0) {
+                    const foundBarcode = barcodes[0].rawValue;
+                    console.log("Barcode found:", foundBarcode);
+                    stopScanner();
+                    lookupBarcode(foundBarcode);
+                } else {
+                    // No barcode found, check again on the next frame
+                    requestAnimationFrame(detectBarcode);
+                }
+            } catch (err) {
+                console.error("Barcode detection error:", err);
+                // Keep trying
+                if (videoStream) {
+                    requestAnimationFrame(detectBarcode);
+                }
+            }
+        }
+
+        // --- API Lookup ---
+
+        /**
+         * Looks up a barcode using the Open Food Facts API.
+         * @param {string} barcode - The barcode number.
+         */
+        async function lookupBarcode(barcode) {
+            if (!barcode) return;
+
+            setStatus(`Looking up barcode ${barcode}...`);
+            productInfoEl.style.display = 'none'; // Hide old info
+            currentProduct = null;
+
+            try {
+                const response = await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name_en,product_name,nutriments,serving_size`);
+                
+                if (!response.ok) {
+                    throw new Error(`API error: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+
+                if (data.status === 1 && data.product) {
+                    const product = data.product;
+                    const nutriments = product.nutriments || {};
+                    
+                    // Prioritize serving calories, fall back to 100g calories
+                    const calories = nutriments['energy-kcal_serving'] || nutriments['energy-kcal'] || nutriments['energy-kcal_100g'];
+                    const calValue = parseFloat(calories);
+                    
+                    // Determine serving size string
+                    let serving = product.serving_size;
+                    if (!serving) {
+                        if (nutriments['energy-kcal_serving']) {
+                            serving = '1 serving';
+                        } else if (nutriments['energy-kcal_100g']) {
+                            serving = '100g';
+                        } else {
+                            serving = 'N/A';
+                        }
+                    }
+
+                    const name = product.product_name_en || product.product_name || 'Unknown Product';
+
+                    currentProduct = {
+                        name: name,
+                        calories: isNaN(calValue) ? 0 : calValue,
+                        serving: serving,
+                        barcode: barcode
+                    };
+                    
+                    renderProductInfo(currentProduct);
+                    setStatus("Product found.");
+
+                } else {
+                    setStatus(`Product not found for barcode: ${barcode}`);
+                }
+            } catch (err) {
+                console.error("API Lookup Error:", err);
+                setStatus("Error fetching product data. Check connection.");
+            }
+        }
+
+        /**
+         * Handles the manual lookup button click.
+         */
+        function manualLookup() {
+            const barcode = manualBarcodeEl.value.trim();
+            if (barcode) {
+                lookupBarcode(barcode);
+                manualBarcodeEl.value = '';
+            } else {
+                setStatus("Please enter a barcode number.");
+            }
+        }
+
+        // --- App Initialization ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // Bind event listeners
+            startScanBtn.addEventListener('click', startScanner);
+            stopScanBtn.addEventListener('click', stopScanner);
+            manualLookupBtn.addEventListener('click', manualLookup);
+
+            // Check for scanner support
+            checkScannerSupport();
+
+            // Setup Firebase
+            setupFirebase();
+        });
+
+    </script>
+</body>
+</html>
